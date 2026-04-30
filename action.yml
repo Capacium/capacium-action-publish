@@ -1,0 +1,110 @@
+name: 'Capacium Publish'
+description: 'Submit a capability to the Capacium Exchange on release'
+author: 'Capacium'
+branding:
+  icon: 'upload-cloud'
+  color: 'green'
+
+inputs:
+  github_url:
+    description: 'GitHub URL of the repository (defaults to the current repository)'
+    required: false
+    default: ''
+  registry_url:
+    description: 'Exchange registry URL (defaults to https://api.capacium.xyz/v2)'
+    required: false
+    default: 'https://api.capacium.xyz/v2'
+  manifest_path:
+    description: 'Path to capability.yaml or SKILL.md (for validation only)'
+    required: false
+    default: 'capability.yaml'
+
+outputs:
+  submitted:
+    description: 'Whether the submission was successful'
+    value: ${{ steps.submit.outputs.submitted }}
+  listing_name:
+    description: 'Canonical name of the submitted listing (owner/name)'
+    value: ${{ steps.submit.outputs.listing_name }}
+  job_id:
+    description: 'Queue job ID for status tracking'
+    value: ${{ steps.submit.outputs.job_id }}
+  status:
+    description: 'Submission status (pending/completed/failed/duplicate)'
+    value: ${{ steps.submit.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Determine GitHub URL
+      id: url
+      run: |
+        if [ -n "${{ inputs.github_url }}" ]; then
+          echo "url=${{ inputs.github_url }}" >> $GITHUB_OUTPUT
+        else
+          echo "url=https://github.com/${{ github.repository }}" >> $GITHUB_OUTPUT
+        fi
+      shell: bash
+
+    - name: Submit to Exchange
+      id: submit
+      run: |
+        URL="${{ inputs.registry_url }}/v2/submit"
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$URL" \
+          -H "Content-Type: application/json" \
+          -d "{\"github_url\": \"${{ steps.url.outputs.url }}\"}")
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        echo "HTTP $HTTP_CODE"
+        echo "$BODY"
+
+        if [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+          CANONICAL=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('canonical_name') or d.get('canonical_hint',''))" 2>/dev/null || echo "")
+          JOB_ID=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('job_id',''))" 2>/dev/null || echo "")
+          STATUS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','duplicate'))" 2>/dev/null || echo "unknown")
+
+          echo "submitted=true" >> $GITHUB_OUTPUT
+          echo "listing_name=$CANONICAL" >> $GITHUB_OUTPUT
+          echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+          if [ -n "$JOB_ID" ]; then
+            echo "  Polling for completion..."
+            for i in $(seq 1 30); do
+              JOB_RESP=$(curl -s "${{ inputs.registry_url }}/v2/submit/$JOB_ID")
+              JOB_STATUS=$(echo "$JOB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+              if [ "$JOB_STATUS" = "completed" ]; then
+                JOB_NAME=$(echo "$JOB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('canonical_name',''))" 2>/dev/null || echo "")
+                echo "listing_name=$JOB_NAME" >> $GITHUB_OUTPUT
+                echo "status=completed" >> $GITHUB_OUTPUT
+                echo "  Listed as: $JOB_NAME"
+                break
+              elif [ "$JOB_STATUS" = "failed" ]; then
+                JOB_ERR=$(echo "$JOB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null || echo "")
+                echo "  Warning: Ingest failed — $JOB_ERR"
+                echo "status=failed" >> $GITHUB_OUTPUT
+                break
+              fi
+              sleep 2
+            done
+          fi
+        else
+          echo "submitted=false" >> $GITHUB_OUTPUT
+          echo "listing_name=" >> $GITHUB_OUTPUT
+          echo "status=error" >> $GITHUB_OUTPUT
+          echo "  Submission failed (HTTP $HTTP_CODE)"
+        fi
+      shell: bash
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "### Capacium Exchange Submit" >> $GITHUB_STEP_SUMMARY
+        echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Submitted | ${{ steps.submit.outputs.submitted }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Listing | ${{ steps.submit.outputs.listing_name }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Status | ${{ steps.submit.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+      shell: bash
