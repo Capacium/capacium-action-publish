@@ -1,110 +1,311 @@
-name: 'Capacium Publish'
-description: 'Submit a capability to the Capacium Exchange on release'
-author: 'Capacium'
-branding:
-  icon: 'upload-cloud'
-  color: 'green'
+name: Capacium Publish
+description: >
+  Validate, package, and publish a Capacium capability to the Exchange registry.
+  Designed for tag-push workflows — pin to a release tag for stability.
 
+branding:
+  icon: package
+  color: blue
+
+# ---------------------------------------------------------------------------
+# Inputs
+# ---------------------------------------------------------------------------
 inputs:
   github_url:
-    description: 'GitHub URL of the repository (defaults to the current repository)'
+    description: >
+      Deprecated compatibility input. Publishing is performed from the checked-out
+      repository using capability_path; this URL is not used by the action.
     required: false
-    default: ''
+    default: ""
+
+  capability_path:
+    description: >
+      Path to `capability.yaml` (or a directory containing one).
+      Relative to the repository root.
+    required: false
+    default: "./capability.yaml"
+
   registry_url:
-    description: 'Exchange registry URL (defaults to https://api.capacium.xyz/v2)'
+    description: >
+      Exchange API base URL.
+      Override for self-hosted or staging registries.
     required: false
-    default: 'https://api.capacium.xyz/v2'
-  manifest_path:
-    description: 'Path to capability.yaml or SKILL.md (for validation only)'
-    required: false
-    default: 'capability.yaml'
+    default: "https://api.capacium.xyz"
 
+  api_token:
+    description: >
+      Exchange API token. Store as a repository secret and pass via
+      `${{ secrets.CAPACIUM_API_TOKEN }}`.
+      Leave empty to use Trusted Publishing (OIDC) instead — no secret needed.
+    required: false
+    default: ""
+
+  use_oidc:
+    description: >
+      Use GitHub Actions OIDC Trusted Publishing instead of a static API token.
+      When enabled, the action requests an OIDC token automatically and exchanges
+      it for a short-lived publish token — no `api_token` secret required.
+      Requires `id-token: write` permission in your workflow.
+    required: false
+    default: "false"
+
+  python_version:
+    description: Python version used to install Capacium CLI.
+    required: false
+    default: "3.11"
+
+  capacium_version:
+    description: >
+      Capacium version to install (pip spec). Defaults to the latest release.
+      Pin for reproducible builds, e.g. `capacium==1.0.0`.
+    required: false
+    default: "capacium"
+
+  fail_on_quality_below:
+    description: >
+      Fail the workflow if the published capability's quality score is below
+      this threshold (0–100). Set to "0" to disable the quality gate.
+    required: false
+    default: "0"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
 outputs:
-  submitted:
-    description: 'Whether the submission was successful'
-    value: ${{ steps.submit.outputs.submitted }}
-  listing_name:
-    description: 'Canonical name of the submitted listing (owner/name)'
-    value: ${{ steps.submit.outputs.listing_name }}
-  job_id:
-    description: 'Queue job ID for status tracking'
-    value: ${{ steps.submit.outputs.job_id }}
-  status:
-    description: 'Submission status (pending/completed/failed/duplicate)'
-    value: ${{ steps.submit.outputs.status }}
+  exchange_url:
+    description: "Exchange listing URL for the published capability."
+    value: ${{ steps.publish.outputs.exchange_url }}
 
+  quality_score:
+    description: "Quality score returned by the Exchange (0–100)."
+    value: ${{ steps.publish.outputs.quality_score }}
+
+  trust_state:
+    description: "Trust state of the published capability (discovered / audited / verified)."
+    value: ${{ steps.publish.outputs.trust_state }}
+
+  canonical_name:
+    description: "Canonical capability name (owner/name) on the Exchange."
+    value: ${{ steps.publish.outputs.canonical_name }}
+
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
 runs:
-  using: 'composite'
+  using: composite
   steps:
-    - name: Determine GitHub URL
-      id: url
-      run: |
-        if [ -n "${{ inputs.github_url }}" ]; then
-          echo "url=${{ inputs.github_url }}" >> $GITHUB_OUTPUT
-        else
-          echo "url=https://github.com/${{ github.repository }}" >> $GITHUB_OUTPUT
-        fi
-      shell: bash
 
-    - name: Submit to Exchange
-      id: submit
+    - name: Set up Python ${{ inputs.python_version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install Capacium CLI
+      shell: bash
+      run: pip install --quiet "${{ inputs.capacium_version }}"
+
+    # ------------------------------------------------------------------
+    # Step 1: Validate
+    # ------------------------------------------------------------------
+    - name: Validate capability manifest
+      shell: bash
       run: |
-        URL="${{ inputs.registry_url }}/v2/submit"
-        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$URL" \
+        echo "::group::cap validate"
+        cap_path="${{ inputs.capability_path }}"
+
+        # Resolve to capability.yaml if a directory was provided
+        if [ -d "$cap_path" ]; then
+          cap_path="${cap_path%/}/capability.yaml"
+        fi
+
+        if [ ! -f "$cap_path" ]; then
+          echo "::error::capability.yaml not found at: $cap_path"
+          exit 1
+        fi
+
+        # cap init --template writes a capability.yaml; cap validate is a
+        # lightweight schema + required-field check.
+        python - <<'PYEOF'
+        import sys, pathlib, re
+
+        path = pathlib.Path("$cap_path")
+        text = path.read_text()
+
+        errors = []
+        required = ["name:", "version:", "kind:"]
+        for field in required:
+            if not re.search(rf"^{field}", text, re.MULTILINE):
+                errors.append(f"Missing required field: {field.rstrip(':')}")
+
+        if errors:
+            for e in errors:
+                print(f"::error::{e}")
+            sys.exit(1)
+
+        print(f"✅  capability.yaml is valid ({path})")
+        PYEOF
+        echo "::endgroup::"
+
+    # ------------------------------------------------------------------
+    # Step 2: Package
+    # ------------------------------------------------------------------
+    - name: Package capability
+      id: package
+      shell: bash
+      run: |
+        echo "::group::cap package"
+        cap_path="${{ inputs.capability_path }}"
+        if [ -d "$cap_path" ]; then
+          cap_path="${cap_path%/}/capability.yaml"
+        fi
+
+        mkdir -p dist
+        cap package --manifest "$cap_path" --output-dir dist/
+
+        tarball=$(ls dist/*.tar.gz 2>/dev/null | head -1)
+        if [ -z "$tarball" ]; then
+          echo "::error::cap package did not produce a .tar.gz in dist/"
+          exit 1
+        fi
+
+        echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+        echo "📦  Packaged: $tarball"
+        echo "::endgroup::"
+
+    # ------------------------------------------------------------------
+    # Step 2b: OIDC Trusted Publishing — exchange OIDC token for publish token
+    # Only runs when use_oidc=true (P2-014)
+    # ------------------------------------------------------------------
+    - name: Obtain Trusted Publish Token (OIDC)
+      id: oidc_exchange
+      if: ${{ inputs.use_oidc == 'true' }}
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry_url }}
+      run: |
+        echo "::group::Trusted Publishing — OIDC token exchange"
+
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::Trusted Publishing requires workflow permission: id-token: write"
+          echo "Add this to the publishing job or workflow:"
+          echo "permissions:"
+          echo "  contents: read"
+          echo "  id-token: write"
+          exit 1
+        fi
+
+        # Request OIDC token from GitHub Actions token endpoint
+        OIDC_TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=capacium" | jq -r '.value')
+
+        if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+          echo "::error::Failed to obtain OIDC token. Ensure 'id-token: write' permission is set."
+          exit 1
+        fi
+
+        # Exchange OIDC token for a scoped Capacium publish token
+        RESPONSE=$(curl -sS -X POST "$REGISTRY/v2/publish/token" \
           -H "Content-Type: application/json" \
-          -d "{\"github_url\": \"${{ steps.url.outputs.url }}\"}")
+          -d "{\"oidc_token\": \"$OIDC_TOKEN\"}")
 
-        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-        BODY=$(echo "$RESPONSE" | sed '$d')
-
-        echo "HTTP $HTTP_CODE"
-        echo "$BODY"
-
-        if [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-          CANONICAL=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('canonical_name') or d.get('canonical_hint',''))" 2>/dev/null || echo "")
-          JOB_ID=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('job_id',''))" 2>/dev/null || echo "")
-          STATUS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','duplicate'))" 2>/dev/null || echo "unknown")
-
-          echo "submitted=true" >> $GITHUB_OUTPUT
-          echo "listing_name=$CANONICAL" >> $GITHUB_OUTPUT
-          echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
-
-          if [ -n "$JOB_ID" ]; then
-            echo "  Polling for completion..."
-            for i in $(seq 1 30); do
-              JOB_RESP=$(curl -s "${{ inputs.registry_url }}/v2/submit/$JOB_ID")
-              JOB_STATUS=$(echo "$JOB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-              if [ "$JOB_STATUS" = "completed" ]; then
-                JOB_NAME=$(echo "$JOB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('canonical_name',''))" 2>/dev/null || echo "")
-                echo "listing_name=$JOB_NAME" >> $GITHUB_OUTPUT
-                echo "status=completed" >> $GITHUB_OUTPUT
-                echo "  Listed as: $JOB_NAME"
-                break
-              elif [ "$JOB_STATUS" = "failed" ]; then
-                JOB_ERR=$(echo "$JOB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null || echo "")
-                echo "  Warning: Ingest failed — $JOB_ERR"
-                echo "status=failed" >> $GITHUB_OUTPUT
-                break
-              fi
-              sleep 2
-            done
-          fi
-        else
-          echo "submitted=false" >> $GITHUB_OUTPUT
-          echo "listing_name=" >> $GITHUB_OUTPUT
-          echo "status=error" >> $GITHUB_OUTPUT
-          echo "  Submission failed (HTTP $HTTP_CODE)"
+        PUBLISH_TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+        if [ -z "$PUBLISH_TOKEN" ]; then
+          echo "::error::OIDC exchange failed: $RESPONSE"
+          exit 1
         fi
-      shell: bash
 
-    - name: Summary
-      if: always()
-      run: |
-        echo "### Capacium Exchange Submit" >> $GITHUB_STEP_SUMMARY
-        echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-        echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Submitted | ${{ steps.submit.outputs.submitted }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Listing | ${{ steps.submit.outputs.listing_name }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Status | ${{ steps.submit.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+        echo "oidc_publish_token=$PUBLISH_TOKEN" >> "$GITHUB_OUTPUT"
+        echo "✅  OIDC publish token obtained (expires in $(echo "$RESPONSE" | jq -r '.expires_in')s)"
+        echo "    Scope: $(echo "$RESPONSE" | jq -r '.scope')"
+        echo "::endgroup::"
+
+    # ------------------------------------------------------------------
+    # Step 3: Publish
+    # ------------------------------------------------------------------
+    - name: Publish to Exchange
+      id: publish
       shell: bash
+      env:
+        # P2-014: use OIDC token if available, otherwise fall back to static token
+        CAPACIUM_API_TOKEN: ${{ inputs.use_oidc == 'true' && steps.oidc_exchange.outputs.oidc_publish_token || inputs.api_token }}
+      run: |
+        echo "::group::cap publish"
+        tarball="${{ steps.package.outputs.tarball }}"
+        registry="${{ inputs.registry_url }}"
+
+        if [ -z "${CAPACIUM_API_TOKEN:-}" ]; then
+          echo "::error::No publish token available. Set api_token or use_oidc: true with id-token: write permission."
+          exit 1
+        fi
+
+        output=$(cap publish "$tarball" \
+          --registry "$registry" \
+          --token "$CAPACIUM_API_TOKEN" 2>&1)
+        exit_code=$?
+        echo "$output"
+
+        if [ $exit_code -ne 0 ]; then
+          echo "::error::cap publish failed (exit $exit_code)"
+          exit $exit_code
+        fi
+
+        # Parse structured output lines emitted by cap publish
+        exchange_url=$(echo "$output"  | grep -oP '(?<=URL:\s)\S+' | head -1)
+        quality_score=$(echo "$output" | grep -oP '(?<=Quality score:\s)\d+' | head -1)
+        trust_state=$(echo "$output"   | grep -oP '(?<=Trust state:\s{3})\S+' | head -1)
+        canonical=$(echo "$output"     | grep -oP '(?<=Published: )\S+' | head -1)
+
+        echo "exchange_url=${exchange_url:-}"   >> "$GITHUB_OUTPUT"
+        echo "quality_score=${quality_score:-0}" >> "$GITHUB_OUTPUT"
+        echo "trust_state=${trust_state:-discovered}" >> "$GITHUB_OUTPUT"
+        echo "canonical_name=${canonical:-}"   >> "$GITHUB_OUTPUT"
+
+        echo "::endgroup::"
+
+    # ------------------------------------------------------------------
+    # Step 4: Quality gate (optional)
+    # ------------------------------------------------------------------
+    - name: Quality gate
+      if: ${{ inputs.fail_on_quality_below != '0' }}
+      shell: bash
+      run: |
+        score="${{ steps.publish.outputs.quality_score }}"
+        threshold="${{ inputs.fail_on_quality_below }}"
+
+        if [ -z "$score" ]; then
+          echo "⚠️  Quality score not available — skipping gate."
+          exit 0
+        fi
+
+        if [ "$score" -lt "$threshold" ]; then
+          echo "::error::Quality score $score is below threshold $threshold."
+          echo "  Improve your capability manifest and re-publish."
+          exit 1
+        fi
+
+        echo "✅  Quality gate passed: $score ≥ $threshold"
+
+    # ------------------------------------------------------------------
+    # Step 5: Summary
+    # ------------------------------------------------------------------
+    - name: Post publish summary
+      if: always()
+      shell: bash
+      run: |
+        exchange_url="${{ steps.publish.outputs.exchange_url }}"
+        score="${{ steps.publish.outputs.quality_score }}"
+        trust="${{ steps.publish.outputs.trust_state }}"
+        canonical="${{ steps.publish.outputs.canonical_name }}"
+
+        echo "## 🚀 Capacium Publish" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        if [ -n "$canonical" ]; then
+          echo "| Field         | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Capability    | \`$canonical\` |" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$exchange_url" ] && echo "| Exchange URL  | $exchange_url |" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$score" ]        && echo "| Quality Score | $score / 100 |" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$trust" ]        && echo "| Trust State   | $trust |" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "Publish did not complete — check logs above." >> "$GITHUB_STEP_SUMMARY"
+        fi
