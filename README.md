@@ -189,3 +189,9 @@ Ensure your registry has a valid TLS certificate. For development registries, se
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+## Development
+
+Canonical repository: **self-hosted Forgejo** — `git.langevc.com/capacium/capacium-action-publish`
+(`git clone git@git.langevc.com:capacium/capacium-action-publish.git`). Develop against the Forgejo
+clone and open pull requests there. The GitHub copy is a read-only mirror.
