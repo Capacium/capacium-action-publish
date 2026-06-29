@@ -1,5 +1,9 @@
 # capacium-action-publish
 
+> [!NOTE]
+> **Public mirror.** The canonical repository is hosted on our self-hosted git.
+> This GitHub copy is a read-only mirror kept in sync for visibility and installation.
+
 **Official GitHub Action for publishing AI capabilities to the [Capacium Exchange](https://capacium.xyz).**
 
 One step — validate, package, and publish. Designed for tag-push workflows.
