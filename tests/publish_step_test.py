@@ -59,49 +59,67 @@ def fill_tokens(body: str) -> str:
 def _grep_shim() -> str:
     """A ``grep`` replacement for the exact invocations in action.yml.
 
-    macOS BSD grep lacks ``-P``. This Python shim supports exactly:
-      * ``grep -oP 'PCRE'``  (with lookbehind; prints first match, `head -1`)
-      * ``grep -iE 'ERE'``   (case-insensitive ERE; prints matching lines)
-    which are the only two forms the publish step uses.
+    macOS BSD grep lacks ``-P``. This Python shim supports the forms the
+    publish step uses:
+      * ``grep -oP 'PCRE'``   (with lookbehind; prints first match, `head -1`)
+      * ``grep -iE 'ERE'``    (case-insensitive ERE; prints matching lines)
+      * ``grep -qF 'str'``    (quiet fixed-string match; exit 0/1 only)
+      * ``grep -F 'str'``     (fixed-string, print matching lines)
+      * ``grep -q ...``       (quiet, print nothing, set exit code)
+    ``-F`` disables regex metacharacters (used for literal canonical names with
+    ``/`` and for literal ``"version": "x.y.z"`` substrings).
     """
     return r'''#!/usr/bin/env python3
 import sys, re
 a = sys.argv[1:]
-pcre = oflag = iflag = ext = False
+pcre = oflag = iflag = ext = fixed = quiet = False
 pat = None
-i = 0
-while i < len(a):
-    x = a[i]
+for x in a:
     if x == "-oP" or x == "-Po":
         oflag = True; pcre = True
     elif x == "-P":
         pcre = True
-    elif x == "-o":
-        oflag = True
     elif x == "-iE" or x == "-Ei":
         iflag = True; ext = True
     elif x == "-i":
         iflag = True
     elif x == "-E":
         ext = True
+    elif x == "-F":
+        fixed = True
+    elif x == "-q":
+        quiet = True
+    elif x in ("-qF", "-Fq"):
+        quiet = True; fixed = True
+    elif x == "-o":
+        oflag = True
     else:
         pat = x
-    i += 1
 flags = re.IGNORECASE if iflag else 0
+if fixed and pat is not None:
+    pat = re.escape(pat)
 rx = re.compile(pat, flags) if pat else None
 text = sys.stdin.read()
 if rx is None:
     sys.exit(0)
+matched = False
 if oflag:
     for line in text.splitlines():
         m = rx.search(line)
         if m:
-            print(m.group(0))
+            matched = True
+            if not quiet:
+                print(m.group(0))
             break
 else:
     for line in text.splitlines():
         if rx.search(line):
-            print(line)
+            matched = True
+            if not quiet:
+                print(line)
+if quiet:
+    sys.exit(0 if matched else 1)
+sys.exit(0)
 '''
 
 
@@ -142,6 +160,12 @@ def main():
             "tests/fixtures/cap-publish-fail.sh",
             "tests/fixtures/cap-publish-empty.sh",
             "tests/fixtures/cap-publish-ok.sh",
+            "tests/fixtures/cap-publish-defeat-c.sh",
+            "tests/fixtures/cap-publish-defeat-1.sh",
+            "tests/fixtures/cap-publish-defeat-2.sh",
+            "tests/fixtures/cap-publish-defeat-3.sh",
+            "tests/fixtures/cap-publish-defeat-4.sh",
+            "tests/fixtures/cap-publish-queued.sh",
         ]
     action_text = Path(ACTION).read_text()
     body = extract_publish_run(action_text)
@@ -149,7 +173,10 @@ def main():
     for stub in fixtures:
         stub_p = Path(stub).resolve()
         name = stub_p.name
-        expect_fail = "-fail" in name or "-empty" in name
+        expect_fail = any(
+            tok in name
+            for tok in ("-fail", "-empty", "-defeat", "-queued")
+        )
         rc, out, outputs = run_step(body, stub_p)
         print(f"=== {name} ===")
         print(out)
@@ -163,7 +190,10 @@ def main():
                 named = (
                     "exchange URL" in out
                     or "canonical name" in out
-                    or "failed submission" in out
+                    or "not found" in out
+                    or "not at the just-published version" in out
+                    or "does not list" in out
+                    or "not owned by" in out
                 )
                 if not named:
                     print(">> FAIL: rejection message does not name the missing evidence")

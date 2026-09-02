@@ -256,32 +256,64 @@ runs:
         canonical=$(echo "$output"     | grep -oP '(?<=Published: )\S+' | head -1)
 
         # ------------------------------------------------------------------
-        # Post-condition: a real publish is observable evidence, not an exit
-        # code. `cap publish` has been observed to exit 0 while its submission
-        # was rejected (HTTP 403 challenge page), so the exit code alone must
-        # not be trusted. A successful publish is the one path through the CLI
-        # that prints BOTH a "Published: <owner/name>" line and a
-        # "URL: <exchange_url>" line (publish command's success branch). A
-        # rejected/submitted-but-failed run never reaches those prints, so
-        # both stay empty here. Require them; fail naming what is missing.
-        # Also treat an explicit failure marker in the output as fatal, so a
-        # future CLI regression that prints "Submission failed"/"Submit failed"
-        # and still exits 0 cannot slip through either.
+        # Post-condition: do NOT read prose for proof of a successful publish.
+        # `cap publish` has been observed to exit 0 while its submission was
+        # rejected (HTTP 403 challenge page) and to print success-shaped lines
+        # ("Published:", "URL:") on a failed/queued path, so neither the exit
+        # code nor the parsed stdout lines can prove a listing landed. A
+        # blocklist of failure phrasings can never be complete.
+        #
+        # Instead, confirm the outcome with the Exchange itself. After the
+        # publish, ask the registry whether the listing now exists at the
+        # canonical name just published: `cap info <owner/name> --json` performs
+        # an independent GET /v2/capabilities/{owner}/{name} and emits its JSON
+        # body only when the listing exists (otherwise "not found"). That
+        # evidence cannot be fabricated by a failing run, because it does not
+        # come from the run — it is a fresh read-back from the registry.
         # ------------------------------------------------------------------
-        failure_marker=$(echo "$output" | grep -iE 'submission failed|submit failed|submitted: false|status: error' | head -1)
 
-        if [ -n "$failure_marker" ]; then
-          echo "::error::cap publish reported a failed submission: $failure_marker"
+        # The four outputs must be populated from the publish run's own stdout
+        # (these are the fields the action reports onward). A run that omits
+        # a URL or a name is a half-publish and must not pass silently.
+        if [ -z "$canonical" ]; then
+          echo "::error::cap publish did not emit a canonical name (missing 'Published: ' line in output); the capability was not named on the Exchange."
           exit 1
         fi
 
         if [ -z "$exchange_url" ]; then
-          echo "::error::cap publish did not emit an exchange URL (missing 'URL: ' line in output); the capability was not listed. A failed publish exits 0 when the CLI cannot reach the Exchange, so the action requires the listing URL as proof the publish occurred."
+          echo "::error::cap publish did not emit an exchange URL (missing 'URL: ' line in output); the capability was not listed."
           exit 1
         fi
 
-        if [ -z "$canonical" ]; then
-          echo "::error::cap publish did not emit a canonical name (missing 'Published: ' line in output); the capability was not named on the Exchange. This output line only appears after a successful publish."
+        # Independent read-back from the Exchange for the listing we just
+        # published: `cap info <owner/name> --json` performs a fresh GET
+        # /v2/capabilities/{owner}/{name} and emits a JSON object only when the
+        # listing exists (otherwise it reports "not found"). This is positive
+        # confirmation — evidence that does not come from the publish run's own
+        # stdout, so a failing/queued run cannot fabricate it.
+        info_json=$(cap info "$canonical" --registry "$registry" --json 2>&1)
+        info_owner="${canonical%%/*}"
+        info_name="${canonical##*/}"
+
+        if ! echo "$info_json" | grep -qF "\"name\": \"${info_name}\""; then
+          echo "::error::cap publish printed a 'Published:' line, but the Exchange does not list a capability named '${info_name}' under owner '${info_owner}' (cap info '$canonical' --json returned no matching listing). The submission was rejected or is only queued — nothing was confirmed published."
+          exit 1
+        fi
+
+        if ! echo "$info_json" | grep -qF "\"owner\": \"${info_owner}\""; then
+          echo "::error::the Exchange lists a capability named '${info_name}' but not owned by '${info_owner}' — the canonical '$canonical' was not confirmed published."
+          exit 1
+        fi
+
+        # cap publish prints "Publishing <owner/name>@<version>..." — the
+        # version sits between '@' and the trailing '...' the CLI appends.
+        published_version=$(echo "$output" | grep -oP '@[0-9][0-9A-Za-z._+-]*' | head -1)
+        published_version="${published_version#@}"
+        while [ -n "$published_version" ] && [ "${published_version%\.}" != "$published_version" ]; do
+          published_version="${published_version%.}"
+        done
+        if [ -n "$published_version" ] && ! echo "$info_json" | grep -qF "\"version\": \"${published_version}\""; then
+          echo "::error::the Exchange lists '$canonical' but not at the just-published version '${published_version}' — the listing was not updated to the submitted version. Nothing was confirmed published."
           exit 1
         fi
 

@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Stub reproducing a normal successful `cap publish`, plus the matching
-# `cap info` read-back the action performs to positively confirm the listing.
-# Dispatches on the first argument, like the real `cap` CLI.
+# Defeat attempt 4 (version-confirmation): publish prints success lines at 1.5.2
+# but the registry read-back returns only the PREVIOUS version 1.5.1 — the
+# listing was not updated. Must be rejected by the version check.
 set -u
-
 if [ "${1:-}" = "info" ]; then
-  # Independent registry read-back: the listing exists at the submitted version.
   cat <<'JSON'
 {
   "$schema": "https://capacium.xyz/schemas/capability-info.json",
@@ -13,19 +11,12 @@ if [ "${1:-}" = "info" ]; then
   "owner": "skillweave",
   "kind": "skill",
   "trust": "discovered",
-  "version": "1.5.2",
-  "description": "SkillWeave",
-  "license": "",
-  "categories": [],
-  "tags": [],
-  "frameworks": [],
-  "runtimes": {},
-  "dependencies": {}
+  "version": "1.5.1",
+  "description": "SkillWeave"
 }
 JSON
   exit 0
 fi
-
 echo 'Publishing skillweave/skillweave@1.5.2...'
 echo 'Published: skillweave/skillweave'
 echo '  Kind: skill'
