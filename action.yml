@@ -255,6 +255,36 @@ runs:
         trust_state=$(echo "$output"   | grep -oP '(?<=Trust state:\s{3})\S+' | head -1)
         canonical=$(echo "$output"     | grep -oP '(?<=Published: )\S+' | head -1)
 
+        # ------------------------------------------------------------------
+        # Post-condition: a real publish is observable evidence, not an exit
+        # code. `cap publish` has been observed to exit 0 while its submission
+        # was rejected (HTTP 403 challenge page), so the exit code alone must
+        # not be trusted. A successful publish is the one path through the CLI
+        # that prints BOTH a "Published: <owner/name>" line and a
+        # "URL: <exchange_url>" line (publish command's success branch). A
+        # rejected/submitted-but-failed run never reaches those prints, so
+        # both stay empty here. Require them; fail naming what is missing.
+        # Also treat an explicit failure marker in the output as fatal, so a
+        # future CLI regression that prints "Submission failed"/"Submit failed"
+        # and still exits 0 cannot slip through either.
+        # ------------------------------------------------------------------
+        failure_marker=$(echo "$output" | grep -iE 'submission failed|submit failed|submitted: false|status: error' | head -1)
+
+        if [ -n "$failure_marker" ]; then
+          echo "::error::cap publish reported a failed submission: $failure_marker"
+          exit 1
+        fi
+
+        if [ -z "$exchange_url" ]; then
+          echo "::error::cap publish did not emit an exchange URL (missing 'URL: ' line in output); the capability was not listed. A failed publish exits 0 when the CLI cannot reach the Exchange, so the action requires the listing URL as proof the publish occurred."
+          exit 1
+        fi
+
+        if [ -z "$canonical" ]; then
+          echo "::error::cap publish did not emit a canonical name (missing 'Published: ' line in output); the capability was not named on the Exchange. This output line only appears after a successful publish."
+          exit 1
+        fi
+
         echo "exchange_url=${exchange_url:-}"   >> "$GITHUB_OUTPUT"
         echo "quality_score=${quality_score:-0}" >> "$GITHUB_OUTPUT"
         echo "trust_state=${trust_state:-discovered}" >> "$GITHUB_OUTPUT"
