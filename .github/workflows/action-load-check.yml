@@ -36,7 +36,7 @@ permissions:
 
 jobs:
   action-loads:
-    name: Composite action loads (uses: ./)
+    name: Action loads via local composite path
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
