@@ -238,6 +238,27 @@ runs:
           exit 1
         fi
 
+        # ------------------------------------------------------------------
+        # Independent version/name, from the ACTION'S OWN INPUTS.
+        # `cap publish` has been observed to exit 0 while its submission was
+        # rejected and to print success-shaped prose on a failed path, so its
+        # stdout is never trusted as proof. The manifest the action itself
+        # read and packaged is the authority for name + version: a lying cap
+        # CLI cannot rewrite it because the action reads the file directly.
+        # ------------------------------------------------------------------
+        cap_path="${{ inputs.capability_path }}"
+        if [ -d "$cap_path" ]; then
+          cap_path="${cap_path%/}/capability.yaml"
+        fi
+        # The manifest this action itself validated/package is the authority
+        # for name + version. awk prints the value after the "key: " prefix and
+        # strips surrounding quotes/whitespace (quotes as \x22/\x27 so no shell
+        # quoting is needed), leaving the bare name/version/owner. This is
+        # independent of cap publish stdout, which is never trusted.
+        manifest_name=$(awk -F': ' '/^name:/{v=$2; gsub(/[\x22\x27 \t]/, "", v); print v; exit}' "$cap_path" 2>/dev/null)
+        manifest_version=$(awk -F': ' '/^version:/{v=$2; gsub(/[\x22\x27 \t]/, "", v); print v; exit}' "$cap_path" 2>/dev/null)
+        manifest_owner=$(awk -F': ' '/^owner:/{v=$2; gsub(/[\x22\x27 \t]/, "", v); print v; exit}' "$cap_path" 2>/dev/null)
+
         output=$(cap publish "$tarball" \
           --registry "$registry" \
           --token "$CAPACIUM_API_TOKEN" 2>&1)
@@ -249,11 +270,97 @@ runs:
           exit $exit_code
         fi
 
-        # Parse structured output lines emitted by cap publish
+        # Parse structured output lines emitted by cap publish. Parsing these
+        # is fine for REPORTING the four outputs onward; but they are NOT
+        # treated as evidence of success (see the post-condition below, which
+        # confirms against the Exchange directly).
         exchange_url=$(echo "$output"  | grep -oP '(?<=URL:\s)\S+' | head -1)
         quality_score=$(echo "$output" | grep -oP '(?<=Quality score:\s)\d+' | head -1)
         trust_state=$(echo "$output"   | grep -oP '(?<=Trust state:\s{3})\S+' | head -1)
         canonical=$(echo "$output"     | grep -oP '(?<=Published: )\S+' | head -1)
+
+        # The four outputs must be populated from the publish run's own stdout
+        # (these are the fields the action reports onward). A run that omits
+        # a URL or a name is a half-publish and must not pass silently.
+        if [ -z "$canonical" ]; then
+          echo "::error::cap publish did not emit a canonical name (missing 'Published: ' line in output); the capability was not named on the Exchange."
+          exit 1
+        fi
+
+        if [ -z "$exchange_url" ]; then
+          echo "::error::cap publish did not emit an exchange URL (missing 'URL: ' line in output); the capability was not listed."
+          exit 1
+        fi
+
+        # The version we expect must come from the action's own inputs, not
+        # from cap publish's prose. If the manifest carried no version, there
+        # is no independent version to confirm against, and we must not claim
+        # success: report UNCONFIRMED and fail.
+        if [ -z "$manifest_version" ]; then
+          echo "::error::UNCONFIRMED — no independent version known: capability.yaml carries no 'version' field, so the publish cannot be confirmed against the Exchange. Refusing to claim success."
+          exit 1
+        fi
+
+        # The Exchange lists a capability at /v2/capabilities/{owner}/{name}.
+        # owner is manifest.owner (the CLI defaults an absent owner to "global",
+        # but confirmation uses the owner/name the manifest and Exchange agree
+        # on). We GET the listing DIRECTLY with curl — NOT via the cap CLI,
+        # which is the very thing under suspicion. Only the Exchange can answer
+        # this; a fabricated/mimicking `cap info` cannot, because it is never
+        # asked.
+        confirm_owner="${manifest_owner:-global}"
+        confirm_name="${manifest_name}"
+        confirm_url="${registry%/}/v2/capabilities/${confirm_owner}/${confirm_name}"
+
+        # curl always writes the body to a file; the HTTP status is captured
+        # separately so a 404/5xx body (which may echo the queried name) is
+        # never mistaken for a listing. The `if` form keeps `set -e` from
+        # aborting the step before we can distinguish "request failed" from
+        # "request returned a non-2xx".
+        confirm_body=$(mktemp)
+        if confirm_status=$(curl -sS -o "$confirm_body" -w '%{http_code}' \
+          -m 30 "$confirm_url" 2>/dev/null); then
+          curl_rc=0
+        else
+          curl_rc=$?
+        fi
+
+        if [ $curl_rc -ne 0 ]; then
+          # Failure mode 1: the confirmation request could not be made at all
+          # (no network / DNS failure / timeout). We must not fall open.
+          rm -f "$confirm_body"
+          echo "::error::cannot confirm the publish: the GET to '$confirm_url' failed (curl exit $curl_rc). Refusing to claim success without Exchange confirmation."
+          exit 1
+        fi
+
+        if [ "$confirm_status" != "200" ]; then
+          # Failure mode 2 (a): non-2xx — 404 not found, or 5xx, etc. The body
+          # is not trusted; the status is decisive.
+          rm -f "$confirm_body"
+          echo "::error::the Exchange did not confirm the publish: GET '$confirm_url' returned HTTP $confirm_status. The listing is not present (or the Exchange errored) — nothing was confirmed published."
+          exit 1
+        fi
+
+        # 2xx: require the body to name the exact version from the manifest, in
+        # the "version" field specifically. The version gate is mandatory here —
+        # a missing/mismatched version is a hard failure, not a skipped check.
+        # We parse the JSON "version" value exactly (whitespace-tolerant around
+        # the colon) so a version string appearing in some OTHER field of the
+        # body (a previous_version, a query echo, a description) is never
+        # mistaken for the current version.
+        confirm_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$confirm_body" 2>/dev/null || true)
+        confirm_version_ok=0
+        if [ -n "$confirm_version" ] && [ "$confirm_version" = "$manifest_version" ]; then
+          confirm_version_ok=1
+        fi
+
+        if [ "$confirm_version_ok" != "1" ]; then
+          rm -f "$confirm_body"
+          echo "::error::the Exchange lists '$confirm_owner/$confirm_name' but not at the just-published version '${manifest_version}' — the listing was not updated to the submitted version (or the body names a different version). Nothing was confirmed published."
+          exit 1
+        fi
+
+        rm -f "$confirm_body"
 
         echo "exchange_url=${exchange_url:-}"   >> "$GITHUB_OUTPUT"
         echo "quality_score=${quality_score:-0}" >> "$GITHUB_OUTPUT"
