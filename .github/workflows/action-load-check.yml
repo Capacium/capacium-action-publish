@@ -26,7 +26,10 @@ name: Action Load Check
 
 on:
   push:
+    branches:
+      - '**'
   workflow_dispatch:
+run-name: "Action Load Check: ${{ github.ref_name }}"
 
 permissions:
   contents: read
