@@ -1,4 +1,4 @@
 name: demo
 version: 1.0.0
-kind: service
+kind: skill
 owner: capacitest
