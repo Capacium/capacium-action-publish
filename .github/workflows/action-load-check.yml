@@ -1,0 +1,68 @@
+# action-load-check.yml
+#
+# WHY THIS EXISTS (do not delete as noise):
+# A composite action can be perfectly valid YAML and still be LOADABLE-UNLOADABLE
+# by GitHub. action.yml metadata strings (notably an input `description`, or any
+# text the template parser reads) are scanned for `${{ ... }}`. `secrets` is not
+# a context that exists inside a composite action, so putting `${{ secrets.* }}`
+# in a description makes the whole action fail to load with:
+#
+#   ##[error]<repo>/action.yml (Line: N, Col: M): Unrecognized named-value: 'secrets'.
+#   ##[error]Failed to load <repo>/action.yml
+#
+# Consumers of this action (@v1) went entirely offline the instant the v1 tag
+# was moved onto a commit carrying that one line. YAML-parses is NOT the same
+# as loads. This workflow is the regression gate that closes that gap: it
+# consumes the action from this repository by LOCAL PATH (`uses: ./`), so GitHub
+# loads/parses action.yml exactly the way a real consumer would. If action.yml
+# becomes unloadable again, this job fails at action load with the same
+# "Unrecognized named-value" error — before any publish-capable step runs.
+#
+# It does NOT publish: the smoke invocation passes no token, disables OIDC, and
+# points at a registry_url that is never contacted (with no token the action
+# refuses publish locally before reaching a registry). Loading the action to a
+# real step is all this gate needs to prove.
+name: Action Load Check
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+run-name: "Action Load Check: ${{ github.ref_name }}"
+
+permissions:
+  contents: read
+
+jobs:
+  action-loads:
+    name: Action loads via local composite path
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Smoke-load the local action
+        # `uses: ./` asks GitHub's runner to download-action / load action.yml
+        # (ActionManifestManager.Load). If the template parser cannot evaluate
+        # action.yml — e.g. a `secrets.*` reference inside an input description —
+        # GitHub rejects the action HERE at load, before any of the composite's
+        # own steps run, with the exact message that took consumers offline:
+        #
+        #   ##[error]...action.yml (Line: N, Col: M): Unrecognized named-value: 'secrets'.
+        #   ##[error]Failed to load .../action.yml
+        #
+        # A job that reaches step execution proves the action LOADED; a template
+        # regression turns this job red at load. No registry is ever contacted:
+        # the empty api_token (and OIDC off) makes the action refuse to publish
+        # locally before it can reach any registry.
+        uses: ./
+        with:
+          api_token: ""
+          use_oidc: "false"
+          registry_url: "https://127.0.0.1:9/do-not-contact"
+          capability_path: "./capability.yaml"
+          fail_on_quality_below: "0"
+
+      - name: Action loaded (reached step execution)
+        run: echo "action.yml loaded and the composite reached step execution."
