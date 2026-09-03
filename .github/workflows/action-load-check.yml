@@ -26,8 +26,6 @@ name: Action Load Check
 
 on:
   push:
-    paths:
-      - action.yml
   workflow_dispatch:
 
 permissions:
