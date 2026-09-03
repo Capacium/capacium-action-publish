@@ -34,9 +34,10 @@ inputs:
 
   api_token:
     description: >
-      Exchange API token. Store as a repository secret and pass via
-      `${{ secrets.CAPACIUM_API_TOKEN }}`.
-      Leave empty to use Trusted Publishing (OIDC) instead — no secret needed.
+      Exchange API token. Store as a repository secret and pass in the
+      calling workflow via the standard secrets context
+      (e.g. `secrets.CAPACIUM_API_TOKEN`). Leave empty to use Trusted
+      Publishing (OIDC) instead — no secret needed.
     required: false
     default: ""
 
