@@ -112,7 +112,16 @@ runs:
       shell: bash
       run: |
         echo "::group::cap validate"
-        cap_path="${{ inputs.capability_path }}"
+        cap_input="${{ inputs.capability_path }}"
+
+        # Anchor a relative capability_path to the checked-out workspace so it
+        # resolves against the consumer's checkout no matter which directory the
+        # step runs from. An absolute path is left untouched.
+        cap_path="${cap_input}"
+        case "$cap_path" in
+          /*) ;;
+          *)  cap_path="${GITHUB_WORKSPACE}/${cap_path}" ;;
+        esac
 
         # Resolve to capability.yaml if a directory was provided
         if [ -d "$cap_path" ]; then
@@ -125,11 +134,13 @@ runs:
         fi
 
         # cap init --template writes a capability.yaml; cap validate is a
-        # lightweight schema + required-field check.
-        python - <<'PYEOF'
+        # lightweight schema + required-field check. The manifest path is passed
+        # as an argument (not interpolated into the quoted heredoc) so the shell
+        # expands it and Python reads the real file.
+        python - "$cap_path" <<'PYEOF'
         import sys, pathlib, re
 
-        path = pathlib.Path("$cap_path")
+        path = pathlib.Path(sys.argv[1])
         text = path.read_text()
 
         errors = []
@@ -155,7 +166,12 @@ runs:
       shell: bash
       run: |
         echo "::group::cap package"
-        cap_path="${{ inputs.capability_path }}"
+        cap_input="${{ inputs.capability_path }}"
+        cap_path="${cap_input}"
+        case "$cap_path" in
+          /*) ;;
+          *)  cap_path="${GITHUB_WORKSPACE}/${cap_path}" ;;
+        esac
         if [ -d "$cap_path" ]; then
           cap_path="${cap_path%/}/capability.yaml"
         fi
@@ -247,7 +263,12 @@ runs:
         # read and packaged is the authority for name + version: a lying cap
         # CLI cannot rewrite it because the action reads the file directly.
         # ------------------------------------------------------------------
-        cap_path="${{ inputs.capability_path }}"
+        cap_input="${{ inputs.capability_path }}"
+        cap_path="${cap_input}"
+        case "$cap_path" in
+          /*) ;;
+          *)  cap_path="${GITHUB_WORKSPACE}/${cap_path}" ;;
+        esac
         if [ -d "$cap_path" ]; then
           cap_path="${cap_path%/}/capability.yaml"
         fi
