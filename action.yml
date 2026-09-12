@@ -220,6 +220,12 @@ runs:
           exit 1
         fi
 
+        # Mask the OIDC token before it can reach any output, log, or later
+        # step's environment. ::add-mask:: takes effect for the remainder of the
+        # job, so every subsequent echo/copy of this value is redacted by the
+        # runner — including an accidental `set -x`.
+        echo "::add-mask::$OIDC_TOKEN"
+
         # Exchange OIDC token for a scoped Capacium publish token
         RESPONSE=$(curl -sS -X POST "$REGISTRY/v2/publish/token" \
           -H "Content-Type: application/json" \
@@ -227,9 +233,16 @@ runs:
 
         PUBLISH_TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
         if [ -z "$PUBLISH_TOKEN" ]; then
-          echo "::error::OIDC exchange failed: $RESPONSE"
+          # RESPONSE may echo the submitted OIDC token; never print it raw under
+          # a failure banner. The masked value is redacted if present.
+          echo "::error::OIDC exchange failed (HTTP response did not carry a token)."
           exit 1
         fi
+
+        # Mask the short-lived publish token the moment it is extracted and
+        # validated — before it is written to GITHUB_OUTPUT (which propagates to
+        # later steps' environments) or appears in any diagnostic.
+        echo "::add-mask::$PUBLISH_TOKEN"
 
         echo "oidc_publish_token=$PUBLISH_TOKEN" >> "$GITHUB_OUTPUT"
         echo "✅  OIDC publish token obtained (expires in $(echo "$RESPONSE" | jq -r '.expires_in')s)"
@@ -281,36 +294,46 @@ runs:
         manifest_version=$(awk -F': ' '/^version:/{v=$2; gsub(/[\x22\x27 \t]/, "", v); print v; exit}' "$cap_path" 2>/dev/null)
         manifest_owner=$(awk -F': ' '/^owner:/{v=$2; gsub(/[\x22\x27 \t]/, "", v); print v; exit}' "$cap_path" 2>/dev/null)
 
-        output=$(cap publish "$tarball" \
+        # Capture the CLI's output AND its true exit code under `set -e`.
+        # `set -e` would abort the step on the assignment itself the moment cap
+        # exits non-zero, before $? could be read — so the command is wrapped in
+        # an `if`, which suspends -e for the guarded command. We then restore
+        # fail-fast behaviour by re-raising the exact exit code below.
+        if output=$(cap publish "$tarball" \
           --registry "$registry" \
-          --token "$CAPACIUM_API_TOKEN" 2>&1)
-        exit_code=$?
+          --token "$CAPACIUM_API_TOKEN" 2>&1); then
+          exit_code=0
+        else
+          exit_code=$?
+        fi
         echo "$output"
 
-        if [ $exit_code -ne 0 ]; then
+        if [ "$exit_code" -ne 0 ]; then
           echo "::error::cap publish failed (exit $exit_code)"
-          exit $exit_code
+          exit "$exit_code"
         fi
 
         # Parse structured output lines emitted by cap publish. Parsing these
         # is fine for REPORTING the four outputs onward; but they are NOT
         # treated as evidence of success (see the post-condition below, which
         # confirms against the Exchange directly).
-        exchange_url=$(echo "$output"  | grep -oP '(?<=URL:\s)\S+' | head -1)
-        quality_score=$(echo "$output" | grep -oP '(?<=Quality score:\s)\d+' | head -1)
-        trust_state=$(echo "$output"   | grep -oP '(?<=Trust state:\s{3})\S+' | head -1)
-        canonical=$(echo "$output"     | grep -oP '(?<=Published: )\S+' | head -1)
+        #
+        # These are OPTIONAL reporting parsers: under `set -e -o pipefail` a
+        # `grep` with no match exits 1, which would abort the whole step before
+        # the readback could run — and current CLI output often carries no
+        # `URL:` line at all. Each substitution therefore swallows its own
+        # failure (`|| true`), so a no-match yields an empty string, never an
+        # abort. `grep -P` is unavailable on BSD grep, so plain `sed` is used
+        # (it is present everywhere, and `-n ... p` with no match prints
+        # nothing and exits 0).
+        exchange_url=$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*URL:[[:space:]]*([^[:space:]]+).*/\1/p' | head -1 || true)
+        quality_score=$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*Quality score:[[:space:]]*([0-9]+).*/\1/p' | head -1 || true)
+        trust_state=$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*Trust state:[[:space:]]+([^[:space:]]+).*/\1/p' | head -1 || true)
+        canonical=$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*Published:[[:space:]]*([^[:space:]]+).*/\1/p' | head -1 || true)
 
-        # The four outputs must be populated from the publish run's own stdout
-        # (these are the fields the action reports onward). A run that omits
-        # a URL or a name is a half-publish and must not pass silently.
+        # A missing canonical name is a half-publish and must not pass silently.
         if [ -z "$canonical" ]; then
           echo "::error::cap publish did not emit a canonical name (missing 'Published: ' line in output); the capability was not named on the Exchange."
-          exit 1
-        fi
-
-        if [ -z "$exchange_url" ]; then
-          echo "::error::cap publish did not emit an exchange URL (missing 'URL: ' line in output); the capability was not listed."
           exit 1
         fi
 
@@ -320,6 +343,15 @@ runs:
         # success: report UNCONFIRMED and fail.
         if [ -z "$manifest_version" ]; then
           echo "::error::UNCONFIRMED — no independent version known: capability.yaml carries no 'version' field, so the publish cannot be confirmed against the Exchange. Refusing to claim success."
+          exit 1
+        fi
+
+        # The manifest identity is likewise authoritative: without an owner/name
+        # there is no coordinate to read back, so the publish cannot be
+        # confirmed. owner defaults to "global" (the CLI's own default), but the
+        # name must come from the manifest.
+        if [ -z "$manifest_name" ]; then
+          echo "::error::UNCONFIRMED — no independent name known: capability.yaml carries no 'name' field, so the publish cannot be confirmed against the Exchange. Refusing to claim success."
           exit 1
         fi
 
@@ -384,7 +416,16 @@ runs:
 
         rm -f "$confirm_body"
 
-        echo "exchange_url=${exchange_url:-}"   >> "$GITHUB_OUTPUT"
+        # The CLI is not required to print a human-facing `URL:` line. When it
+        # does not, the confirmed readback coordinate IS the authoritative
+        # exchange URL: it was built independently from the manifest identity
+        # plus the registry, and the Exchange answered HTTP 200 for the exact
+        # manifest version. A URL printed by the CLI is reporting, not evidence.
+        if [ -z "$exchange_url" ]; then
+          exchange_url="$confirm_url"
+        fi
+
+        echo "exchange_url=${exchange_url}"   >> "$GITHUB_OUTPUT"
         echo "quality_score=${quality_score:-0}" >> "$GITHUB_OUTPUT"
         echo "trust_state=${trust_state:-discovered}" >> "$GITHUB_OUTPUT"
         echo "canonical_name=${canonical:-}"   >> "$GITHUB_OUTPUT"

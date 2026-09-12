@@ -230,6 +230,12 @@ def run_step(body: str, case: dict) -> tuple[int, str, dict]:
         (shimdir / "grep").chmod(0o755)
         (Path(d) / "capability.yaml").write_text(manifest_text)
         env["PATH"] = str(shimdir) + os.pathsep + env.get("PATH", "")
+        # The publish step anchors a relative capability_path to
+        # $GITHUB_WORKSPACE, exactly as the runner sets it. Without this the
+        # step resolves the manifest to a nonexistent path, the awk
+        # substitutions fail under `set -e`, and every case dies at rc 2 for a
+        # harness reason rather than the behaviour under test.
+        env["GITHUB_WORKSPACE"] = d
         out_file = Path(d) / "gh-out"
         env["GITHUB_OUTPUT"] = str(out_file)
         proc = subprocess.run(
@@ -255,6 +261,20 @@ OK_PUBLISH = (
     "  Trust state:   discovered\n"
     "  Quality score: 45/100\n"
 )
+
+# Current CLI output frequently carries NO human-facing `URL:` line. Success
+# must not depend on it: the readback coordinate built from the manifest
+# identity + registry is authoritative, and is reported as exchange_url.
+OK_PUBLISH_NO_URL = (
+    "Publishing skillweave/skillweave@1.5.2...\n"
+    "Published: skillweave/skillweave\n"
+    "  Kind: skill\n"
+    "  Trust state:   audited\n"
+    "  Quality score: 72/100\n"
+)
+
+# The coordinate the publish step builds itself from the manifest + registry.
+CONFIRM_URL = "https://api.capacium.xyz/v2/capabilities/skillweave/skillweave"
 
 OK_CONFIRM_BODY = (
     '{\n'
@@ -283,6 +303,9 @@ def ok_case(name, **kw):
         "curl_fail": False,
         "expect": True,
         "msg_token": "",
+        "expect_url": EXCHANGE_URL,
+        "expect_quality": "45",
+        "expect_trust": "discovered",
     }
     c.update(kw)
     return c
@@ -494,6 +517,108 @@ CASES = [
                 "  Trust state:   discovered\n"
                 "  Quality score: 45/100\n"
             )),
+
+    # -- HOTFIX REGRESSIONS ---------------------------------------------------
+
+    # R4a. CLI prints a successful publish WITHOUT a `URL:` line. The step must
+    #      still pass and must report the independently confirmed readback
+    #      coordinate as exchange_url. Before the fix this aborted at the
+    #      optional `grep` under `set -e -o pipefail`.
+    ok_case("regression-success-without-url-line",
+            cap_stdout=OK_PUBLISH_NO_URL,
+            expect_url=CONFIRM_URL,
+            expect_quality="72",
+            expect_trust="audited"),
+
+    # R3/R4b. CLI output carries NONE of the optional reporting lines (only the
+    #      mandatory canonical name). Every optional parser no-matches; none may
+    #      abort the step under fail-fast shell behaviour. Readback still passes
+    #      and its coordinate is the reported URL.
+    ok_case("regression-all-optional-parsers-no-match",
+            cap_stdout="Published: skillweave/skillweave\n",
+            expect_url=CONFIRM_URL,
+            expect_quality="0",
+            expect_trust="discovered"),
+
+    # R2. Nonzero CLI exit must still fail with the exact exit code, despite the
+    #     `if output=$(...)` wrapper that suspends `set -e`.
+    {
+        "name": "regression-nonzero-cli-exit",
+        "manifest": dict(GOOD_MANIFEST),
+        "cap_stdout": "HTTP 500 — the Exchange rejected the submission.\n",
+        "cap_exit": 7,
+        "curl_status": "200",
+        "curl_body": OK_CONFIRM_BODY,
+        "curl_fail": False,
+        "expect": False,
+        "expect_rc": 7,
+        "msg_token": "cap publish failed (exit 7)",
+    },
+
+    # R5. Readback returns HTTP 200 but for the WRONG version -> fail.
+    {
+        "name": "regression-readback-version-mismatch",
+        "manifest": dict(GOOD_MANIFEST),
+        "cap_stdout": OK_PUBLISH_NO_URL,
+        "cap_exit": 0,
+        "curl_status": "200",
+        "curl_body": OK_CONFIRM_BODY.replace('"1.5.2"', '"9.9.9"'),
+        "curl_fail": False,
+        "expect": False,
+        "msg_token": "not at the just-published version",
+    },
+
+    # R5. Readback request fails outright (network) -> fail closed.
+    {
+        "name": "regression-readback-request-fails",
+        "manifest": dict(GOOD_MANIFEST),
+        "cap_stdout": OK_PUBLISH_NO_URL,
+        "cap_exit": 0,
+        "curl_status": "",
+        "curl_body": "",
+        "curl_fail": True,
+        "expect": False,
+        "msg_token": "cannot confirm the publish",
+    },
+
+    # R5. Readback returns a non-200 (404: listing absent) -> fail closed.
+    {
+        "name": "regression-readback-non-200",
+        "manifest": dict(GOOD_MANIFEST),
+        "cap_stdout": OK_PUBLISH_NO_URL,
+        "cap_exit": 0,
+        "curl_status": "404",
+        "curl_body": '{"detail": "Capability not found"}\n',
+        "curl_fail": False,
+        "expect": False,
+        "msg_token": "returned HTTP 404",
+    },
+
+    # R5. Readback body is not valid JSON -> fail closed (version unparseable).
+    {
+        "name": "regression-readback-invalid-json",
+        "manifest": dict(GOOD_MANIFEST),
+        "cap_stdout": OK_PUBLISH_NO_URL,
+        "cap_exit": 0,
+        "curl_status": "200",
+        "curl_body": "<html>not json</html>\n",
+        "curl_fail": False,
+        "expect": False,
+        "msg_token": "not at the just-published version",
+    },
+
+    # R5. Manifest carries no name -> no coordinate to read back -> fail closed.
+    {
+        "name": "regression-missing-manifest-name",
+        "manifest": {"name": "", "version": "1.5.2", "owner": "skillweave"},
+        "cap_stdout": OK_PUBLISH_NO_URL,
+        "cap_exit": 0,
+        "curl_status": "200",
+        "curl_body": OK_CONFIRM_BODY,
+        "curl_fail": False,
+        "expect": False,
+        "msg_token": "no independent name known",
+    },
 ]
 
 
@@ -522,9 +647,9 @@ def main():
             ok = (
                 rc == 0
                 and outputs.get("canonical_name") == CANONICAL
-                and outputs.get("exchange_url") == EXCHANGE_URL
-                and outputs.get("quality_score") == "45"
-                and outputs.get("trust_state") == "discovered"
+                and outputs.get("exchange_url") == case.get("expect_url", EXCHANGE_URL)
+                and outputs.get("quality_score") == case.get("expect_quality", "45")
+                and outputs.get("trust_state") == case.get("expect_trust", "discovered")
             )
             if not ok:
                 print(">> FAIL: expected pass with all four outputs; got rc=%s outputs=%s" % (rc, outputs))
@@ -532,8 +657,12 @@ def main():
             else:
                 print(">> okay: passed and set all four outputs")
         else:
+            expect_rc = case.get("expect_rc")
             if rc == 0:
                 print(">> FAIL: expected step to fail, but it PASSED")
+                failures += 1
+            elif expect_rc is not None and rc != expect_rc:
+                print(">> FAIL: expected exit code %s, got %s" % (expect_rc, rc))
                 failures += 1
             elif case["msg_token"] not in out:
                 print(">> FAIL: reject message missing expected token %r" % case["msg_token"])
