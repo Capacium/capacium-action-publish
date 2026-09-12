@@ -1,3 +1,6 @@
 # SkillWeave runtime stays local; the organization planning helper is tracked.
 .skillweave/*
 !.skillweave/agents.md
+
+__pycache__/
+*.pyc
